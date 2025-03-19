@@ -3,7 +3,7 @@
 
 import json
 import math
-
+from typing import Union, List, Optional
 import fire
 import requests
 import torch
