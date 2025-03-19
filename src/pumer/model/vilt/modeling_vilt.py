@@ -100,14 +100,17 @@ class ViltModel(ViltPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         **kwargs,
-    ):
+    ):  
+        torch.manual_seed(42)  # Fixed seed
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         text_embeds = self.text_embeddings(text_ids)
-        image_embeds, image_masks, _, _ = self.transformer.visual_embed(
+        image_embeds, image_masks, (patch_index, _), _ = self.transformer.visual_embed(
             pixel_values,
             max_image_len=-1,
             mask_it=False,
@@ -141,9 +144,12 @@ class ViltModel(ViltPreTrainedModel):
         kwargs["merge_r"] = self.config.merge_r
         for layer_idx, blk in enumerate(self.transformer.blocks):
             # print(f"{layer_idx=}, {x.shape=}, {text_len=}")
+            kwargs["patch_index"] = patch_index 
+            kwargs["layer_idx"] = layer_idx 
             kwargs["text_len"] = text_len
             kwargs["text_masks"] = text_masks
             if self.config.reduce_layers and layer_idx in self.config.reduce_layers:
+                
                 kwargs["merge_text"] = self.config.merge_text
                 kwargs["merge_r"] = self.config.merge_r
                 kwargs["prune_r"] = self.config.prune_r

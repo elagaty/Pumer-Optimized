@@ -24,7 +24,7 @@ import os
 import urllib
 import warnings
 from functools import partial
-
+# import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,8 +40,11 @@ from ..common import differentiable_masked_softmax
 from ..reducer import (
     bipartite_diff_matching,
     bipartite_soft_matching,
+    # bipartite_soft_matching_track,
     bipartite_weighted_matching,
-    merge_wavg,
+    bipartite_soft_matching_new,
+    merge_wavg#,
+    # merge_wavg_track,
 )
 
 from timm.models.layers import (  # isort:skip
@@ -326,6 +329,7 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x, attn, k.mean(1), q.mean(1)
 
+# global_map = None
 
 class Block(nn.Module):
     def __init__(
@@ -361,22 +365,80 @@ class Block(nn.Module):
             act_layer=act_layer,
             drop=drop,
         )
+        
 
-    def forward(self, x, mask=None, **kwargs):
-        _x, attn, metric, q_metric = self.attn(self.norm1(x), mask=mask)
+    def update_global_map(self, global_map, image_states, layer_idx, prune_r, merge_r, top_idx=None, merge_info=None):
+        batch_size, num_tokens, _ = image_states.shape
+
+
+        # Initialize global_map at first pruning layer (layer 2)
+        if not global_map:
+            global_map = [
+                [[idx], emb, [idx], []]  # [[orig_indices], emb, pos_history, merge_history]
+                for idx, emb in enumerate(image_states[0])
+            ]
+        if layer_idx not in [2, 5, 8]:
+            # Update embeddings only for non-pruning/merging layers
+            for i in range(num_tokens):
+                if i < len(global_map):
+                    global_map[i][1] = image_states[0][i]
+            return global_map
+        # Handle pruning
+        if prune_r > 0 and top_idx is not None:
+            kept_indices = top_idx[0].tolist()
+            global_map = [global_map[i] for i in kept_indices]  # Filter pruned entries
+            # Update positions for remaining tokens
+            for new_pos, entry in enumerate(global_map):
+                entry[2].append(new_pos)  # Track new position
+
+        # Handle merging
+        if merge_r > 0 and merge_info is not None:
+            entries_to_remove = []
+            new_entries = []
+            for src_idx, dst_idx, new_idx in merge_info:
+                # Find src/dst entries by their CURRENT position (last in pos_history)
+                src_entry = next(e for e in global_map if e[2][-1] == src_idx)
+                dst_entry = next(e for e in global_map if e[2][-1] == dst_idx)
+                entries_to_remove.extend([src_entry, dst_entry])
+                
+                # Create merged entry
+                merged_entry = [
+                    src_entry[0] + dst_entry[0],  # Combine original indices (lists)
+                    image_states[0][new_idx],      # Current embedding
+                    [new_idx],                     # Position history
+                    src_entry[3] + dst_entry[3] + [(src_idx, dst_idx, layer_idx)]  # Merge history
+                ]
+                new_entries.append(merged_entry)
+            
+            # Remove old entries and add new merged ones
+            global_map = [e for e in global_map if e not in entries_to_remove]
+            global_map.extend(new_entries)
+            
+            # Re-index positions after merging
+            for new_pos, entry in enumerate(global_map):
+                entry[2][-1] = new_pos  # Update current position
+
+        # Update embeddings for all tokens
+        for i, entry in enumerate(global_map):
+            entry[1] = image_states[0][i]
+        
+        return global_map
+
+
+    def forwardd(self, x, mask=None, layer_idx=None,**kwargs): # this is the original
+        _x, attn, metric, q_metric = self.attn(self.norm1(x), mask=mask) #x, attn, k.mean(1), q.mean(1)
         x = x + self.drop_path(_x)
         text_len = kwargs.pop("text_len")
         batch_size, x_len, hidden_size = x.shape
         image_length = int(x_len - text_len)  # with cls token
 
         prune_ratio = kwargs.pop("prune_r", 0)
-        # print(f"{prune_ratio=}, {image_length=}")
         prune_r = round(prune_ratio * image_length)
-        # keep_ratio = kwargs.pop("keep_ratio", 0)
-        # keep_r = round(keep_ratio * image_length)
-        # merge_ratio = kwargs.pop("merge_ratio", 0)
-        # text_mr = kwargs.pop("text_mr", 0)
         merge_ratio = kwargs.pop("merge_r", 0)
+        
+     
+        
+            
 
         """
         reduce strategy:
@@ -395,7 +457,10 @@ class Block(nn.Module):
         merge option: tome k metric (no text informed), dissimilar metric
 
         """
+        
         text_states = x[:, :text_len]
+        image_states = x[:, text_len:]
+ 
         if prune_r > 0:
             merge_r = round(merge_ratio * image_length)
             image_states = x[:, text_len:]
@@ -403,8 +468,7 @@ class Block(nn.Module):
             text_masks = kwargs["text_masks"]
             # get true text len for each example
             t_len = text_masks.sum(1, keepdim=True)
-            # print(f"before {x.shape=}, {keep_r=}")
-            # print(f"{keep_r=}, {merge_r=}, {prune_r=}")
+
 
             sim_method = kwargs["sim_method"]
             if sim_method in ["k_metric", "km"]:
@@ -429,9 +493,9 @@ class Block(nn.Module):
             elif sim_method in ["mean_head", "mh"]:
                 cross_attn = attn[:, :, :text_len, text_len:]
                 attn_scores = cross_attn.mean(1).sum(1) / t_len
-                # top_val = attn_scores
+        
                 top_val, top_idx = torch.topk(attn_scores, keep_r, dim=-1)
-                # print(f"{attn_scores.shape=}, {top_val.shape=}")
+
             elif sim_method in ["first_head", "fh"]:
                 cross_attn = attn[:, :, :text_len, text_len:]
                 attn_scores = cross_attn[:, 0].sum(1) / t_len
@@ -439,13 +503,12 @@ class Block(nn.Module):
                 top_val, top_idx = torch.topk(attn_scores, keep_r, dim=-1)
             else:
                 raise ValueError(f"unsupported {sim_method=}")
+           
 
+         
             t_idx = top_idx.unsqueeze(2).expand(batch_size, keep_r, hidden_size)
             new_image_states = image_states.gather(1, t_idx)
-            # print(f"prune {new_image_states.shape=}, {keep_r=}")
-            # new_image_states = x[:, text_len:]
-
-            # for new image states, merge r image tokens
+          
             if merge_r > 0:
                 merge_style = kwargs.get("merge_style", "tip")
                 img_metric = metric[:, text_len:]
@@ -453,9 +516,13 @@ class Block(nn.Module):
                 new_img_metric = img_metric.gather(1, tm_idx)
                 if merge_style == "tome":
                     # use tome style merging
-                    # print(f"{merge_r=}")
+                    # merge_fn = bipartite_soft_matching(new_img_metric, merge_r) 
+
+                    # merge_fn_track, r, src_idx, dst_idx, unm_idx = bipartite_soft_matching_track(new_img_metric, merge_r)
+                    # new_image_states_track, _, merge_info = merge_wavg_track(merge_fn_track, new_image_states, r=r, src_idx=src_idx, dst_idx=dst_idx, unm_idx=unm_idx)
                     merge_fn = bipartite_soft_matching(new_img_metric, merge_r)
                     new_image_states, _ = merge_wavg(merge_fn, new_image_states)
+
                 elif merge_style == "tip":
                     new_image_states = bipartite_weighted_matching(
                         new_image_states, new_img_metric, top_val, merge_r, mode="sum"
@@ -465,16 +532,18 @@ class Block(nn.Module):
                     new_image_states = bipartite_diff_matching(new_image_states, top_val, merge_r, mode="sum")
                 else:
                     raise ValueError(f"{merge_style=} not implemented!")
-
+            
+          
             # merge text
             text_mr = kwargs.get("merge_text", 0)
-            # text_r = int(text_mr)
             text_r = round(int(text_len) * text_mr)
             # print(f"{merge_r=}, {text_r=}")
-
+    
             if text_r > 0:
                 text_metric = metric[:, :text_len]
+
                 merge_fn = bipartite_soft_matching(text_metric, text_r)
+
                 text_states, _ = merge_wavg(merge_fn, text_states)
 
                 mask_m = text_masks[..., None]
@@ -488,13 +557,19 @@ class Block(nn.Module):
                 dtype=torch.long,
                 device=new_image_states.device,
             )
-            # print(f"merge {new_image_states.shape=}, {new_img_masks.shape=}, {merge_r=}")
             mask = torch.cat([text_masks, new_img_masks], dim=1)
             x = torch.cat([text_states, new_image_states], dim=1)
+            # print("shape of image tokens is ",new_image_states.shape)
             # print(f"merge {x.shape=}, {mask.shape=}")
 
+        
         else:
             merge_r = int(merge_ratio)
+            new_image_states = image_states
+            top_idx = None
+            merge_info = None
+            unm_idx = None
+
             # tome merging
             if merge_r > 0:
                 # print(f"{merge_r=}")
@@ -504,9 +579,378 @@ class Block(nn.Module):
                 mask_m = mask[..., None]
                 mask_m, _ = merge_wavg(merge_fn, mask_m)
                 mask = mask_m[..., 0]
+        # # print("layer is ",layer_idx)
+        # global_map = self.update_global_map( global_map,image_states, layer_idx, prune_r, merge_r, top_idx, merge_info)
+        # if(layer_idx==11):
+        #     for gm in global_map:
+        #         # Print the index, position history, and merge history (excluding the embedding array)
+        #         print(gm[0])
+
+        #     global_map =  None
+        if (layer_idx == 8):
+            print("num tokens at layer 8 is ",image_states.shape)
+        if (layer_idx == 11):
+            print("num tokens at layer 11 is ",image_states.shape)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x, attn, mask, text_len
+    def forwardd(self, x, mask=None, layer_idx=None,**kwargs): # this is to try turn off sort
+        _x, attn, metric, q_metric = self.attn(self.norm1(x), mask=mask) #x, attn, k.mean(1), q.mean(1)
+        x = x + self.drop_path(_x)
+        text_len = kwargs.pop("text_len")
+        batch_size, x_len, hidden_size = x.shape
 
+        
+        prune_ratio = kwargs.pop("prune_r", 0)
+        if prune_ratio == 0:
+            prune_r = 0
+        else:
+            prune_r = 0.8
+        
+        merge_ratio = kwargs.pop("merge_r", 0)
+
+        """
+        reduce strategy:
+        todo: use k metric and calculate text-image similarity as the cross-attn
+
+        use text to guide prune, then merge text and rest image tokens
+
+        1. cross-attn to decide prune, for remaining tokens, merge less attended tokens (unimportant but still contributes information), more attended tokens have fine-grained information for understanding tasks
+        1.1 optimization, regularize attention over pruned tokens to uniformity (lower scores), alignment (coherent scores)?
+        2. use k metric to decide merge, how to use text info?
+
+        3. use k metric to decide prune
+
+        ablation: every 3 layers as dyvit or every layer as tome
+        ratio of merge and prune
+        merge option: tome k metric (no text informed), dissimilar metric
+
+        """
+        
+        text_states = x[:, :text_len]
+        image_states = x[:, text_len:]
+        if prune_r > 0:
+            if merge_ratio == 0:
+                merge_r = 0
+            else:
+                merge_r = 0.8
+           
+            image_states = x[:, text_len:]
+            keep_r = max(image_states.shape[1] - prune_r, 1)
+            text_masks = kwargs["text_masks"]
+            # get true text len for each example
+            t_len = text_masks.sum(1, keepdim=True)
+
+            sim_method = kwargs["sim_method"]
+            if sim_method in ["k_metric", "km"]:
+                t_metric = metric[:, :text_len]
+                v_metric = metric[:, text_len:]
+                tv_sim = t_metric @ v_metric.transpose(-2, -1)
+
+                scores = tv_sim.sum(1) / t_len
+                # top_val = scores
+                top_val, top_idx = torch.topk(scores, keep_r, dim=-1)
+
+            elif sim_method == "qk":
+                # text q, image k, get cross attn
+                t_metric = q_metric[:, :text_len]
+                v_metric = metric[:, text_len:]
+                tv_sim = t_metric @ v_metric.transpose(-2, -1)
+
+                scores = tv_sim.sum(1) / t_len
+                # top_val = scores
+                top_val, top_idx = torch.topk(scores, keep_r, dim=-1)
+
+            elif sim_method in ["mean_head", "mh"]:
+                # print("STARTING PRUNING")
+                cross_attn = attn[:, :, :text_len, text_len:]
+                attn_scores = cross_attn.mean(1).sum(1) / t_len
+                # min_scores = attn_scores.min(dim=1, keepdim=True)[0]
+                # max_scores = attn_scores.max(dim=1, keepdim=True)[0]
+                min_scores, max_scores = torch.aminmax(attn_scores, dim=1, keepdim=True)
+                normalized_scores = (attn_scores - min_scores) / (max_scores - min_scores + 1e-8)
+                # print("batch size is ",batch_size)
+          
+                # prune_thresh = 0.001 * (1.1)**(layer_idx-2) 
+                # print("prune ratio is ",prune_ratio)
+             
+
+                prune_ratio = 0.0005
+                mult_batch = batch_size>1
+                if (mult_batch):
+                    first_image_threshold_mask = normalized_scores[0] > prune_ratio 
+                    keep_r = first_image_threshold_mask.sum().item()
+                    keep_r = max(keep_r, 1)
+                    top_val, top_idx = torch.topk(attn_scores, keep_r, dim=1)
+                else:
+                    first_image_threshold_mask = normalized_scores > prune_ratio 
+                    keep_r = first_image_threshold_mask.sum(dim=1, keepdim=True)
+                    keep_r = keep_r.clamp(min=1)
+                    selected_indices = torch.nonzero(first_image_threshold_mask, as_tuple=True)[1].unsqueeze(0).expand(batch_size, -1)
+
+                # Ensure at least one token is kept
+                
+                
+                # Ensure we always keep at least 1 token
+                # keep_r = max(keep_r, 1)
+                # print(layer_idx)
+                # print("attn scores is ",attn_scores.shape)
+                # print(attn_scores)
+                # Select top indices for each batch
+                
+                # top_val, top_idx = torch.topk(attn_scores, keep_r, dim=1)
+                # print("top idx is ", selected_indices)
+            elif sim_method in ["first_head", "fh"]:
+                cross_attn = attn[:, :, :text_len, text_len:]
+                attn_scores = cross_attn[:, 0].sum(1) / t_len
+                # top_val = attn_scores
+                top_val, top_idx = torch.topk(attn_scores, keep_r, dim=-1)
+                
+            else:
+                raise ValueError(f"unsupportsed {sim_method=}")
+            if (mult_batch):
+                selected_indices = top_idx
+            t_idx = selected_indices.unsqueeze(2).expand(batch_size, keep_r, hidden_size)
+            # print("t_idx idx is ", t_idx.shape)
+            # print(t_idx)
+            # print("image_states idx is ", image_states.shape)
+            # print(image_states)
+            new_image_states = image_states.gather(1, t_idx)
+            # print("new_image_states idx is ", new_image_states.shape)
+            # print(new_image_states)
+
+    
+            if merge_r > 0:
+                merge_style = kwargs.get("merge_style", "tip")
+                img_metric = metric[:, text_len:]
+                tm_idx = selected_indices.unsqueeze(2).expand(batch_size, keep_r, metric.shape[-1])
+                new_img_metric = img_metric.gather(1, tm_idx)
+                if merge_style == "tome":
+                    merge_fn = bipartite_soft_matching_new(0.9,new_img_metric)
+                    new_image_states, _ = merge_wavg(merge_fn, new_image_states)
+                elif merge_style == "tip":
+                    new_image_states = bipartite_weighted_matching(
+                        new_image_states, new_img_metric, top_val, merge_r, mode="sum"
+                    )
+
+                elif merge_style == "diff":
+                    new_image_states = bipartite_diff_matching(new_image_states, top_val, merge_r, mode="sum")
+                else:
+                    raise ValueError(f"{merge_style=} not implemented!")
+
+            # merge text
+            text_mr = kwargs.get("merge_text", 0)
+            if text_mr == 0:
+                text_r = 0
+            else:
+                text_r = 0.8
+    
+            if text_r > 0:
+                text_metric = metric[:, :text_len]
+                merge_fn = bipartite_soft_matching_new(0.9,text_metric)
+                text_states, _ = merge_wavg(merge_fn, text_states)
+                mask_m = text_masks[..., None]
+                mask_m, _ = merge_wavg(merge_fn, mask_m)
+                text_masks = mask_m[..., 0]
+
+                text_len = text_states.shape[1]
+
+            new_img_masks = torch.ones(
+                (batch_size, new_image_states.shape[1]),
+                dtype=torch.long,
+                device=new_image_states.device,
+            )
+            mask = torch.cat([text_masks, new_img_masks], dim=1)
+            x = torch.cat([text_states, new_image_states], dim=1)
+        else:
+            merge_r = int(merge_ratio)
+            if merge_r > 0:
+                merge_fn = bipartite_soft_matching(metric, merge_r)
+                x, _ = merge_wavg(merge_fn, x)
+                mask_m = mask[..., None]
+                mask_m, _ = merge_wavg(merge_fn, mask_m)
+                mask = mask_m[..., 0]
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x, attn, mask, text_len
+    def forward(self, x, mask=None, layer_idx=None,**kwargs): # this is for testing
+        _x, attn, metric, q_metric = self.attn(self.norm1(x), mask=mask) #x, attn, k.mean(1), q.mean(1)
+        x = x + self.drop_path(_x)
+        text_len = kwargs.pop("text_len")
+        batch_size, x_len, hidden_size = x.shape
+
+        
+        prune_ratio = kwargs.pop("prune_r", 0)
+        if prune_ratio == 0:
+            prune_r = 0
+        else:
+            prune_r = 0.8
+        
+        merge_ratio = kwargs.pop("merge_r", 0)
+        text_mr = kwargs.get("merge_text", 0)
+
+        """
+        reduce strategy:
+        todo: use k metric and calculate text-image similarity as the cross-attn
+
+        use text to guide prune, then merge text and rest image tokens
+
+        1. cross-attn to decide prune, for remaining tokens, merge less attended tokens (unimportant but still contributes information), more attended tokens have fine-grained information for understanding tasks
+        1.1 optimization, regularize attention over pruned tokens to uniformity (lower scores), alignment (coherent scores)?
+        2. use k metric to decide merge, how to use text info?
+
+        3. use k metric to decide prune
+
+        ablation: every 3 layers as dyvit or every layer as tome
+        ratio of merge and prune
+        merge option: tome k metric (no text informed), dissimilar metric
+
+        """
+        
+        text_states = x[:, :text_len]
+        image_states = x[:, text_len:]
+        
+        if prune_r > 0:
+            if merge_ratio == 0:
+                merge_r = 0
+            else:
+                merge_r = 0.8
+           
+            image_states = x[:, text_len:]
+            keep_r = max(image_states.shape[1] - prune_r, 1)
+            text_masks = kwargs["text_masks"]
+            # get true text len for each example
+            t_len = text_masks.sum(1, keepdim=True)
+
+            sim_method = kwargs["sim_method"]
+            if sim_method in ["k_metric", "km"]:
+                t_metric = metric[:, :text_len]
+                v_metric = metric[:, text_len:]
+                tv_sim = t_metric @ v_metric.transpose(-2, -1)
+
+                scores = tv_sim.sum(1) / t_len
+                # top_val = scores
+                top_val, top_idx = torch.topk(scores, keep_r, dim=-1)
+
+            elif sim_method == "qk":
+                # text q, image k, get cross attn
+                t_metric = q_metric[:, :text_len]
+                v_metric = metric[:, text_len:]
+                tv_sim = t_metric @ v_metric.transpose(-2, -1)
+
+                scores = tv_sim.sum(1) / t_len
+                # top_val = scores
+                top_val, top_idx = torch.topk(scores, keep_r, dim=-1)
+
+            elif sim_method in ["mean_head", "mh"]:
+                # print("STARTING PRUNING")
+                cross_attn = attn[:, :, :text_len, text_len:]
+                attn_scores = cross_attn.mean(1).sum(1) / t_len
+                v0 = attn_scores[:, :1]
+                remaining_vectors = attn_scores[:, 1:] 
+                min_scores, max_scores = torch.aminmax(remaining_vectors, dim=1, keepdim=True)
+                normalized_remaining_vectors = (remaining_vectors - min_scores) / (max_scores - min_scores + 1e-8)
+                # min_scores, max_scores = torch.aminmax(attn_scores, dim=1, keepdim=True)
+                # normalized_scores = (attn_scores - min_scores) / (max_scores - min_scores + 1e-8)
+                normalized_scores = torch.cat([v0, normalized_remaining_vectors], dim=1)
+
+               
+                if(layer_idx == 3):
+                    prune_ratio = 0.11
+                elif (layer_idx==6):
+                    prune_ratio = 0.04
+                else:
+                    prune_ratio = 0.0005
+
+                # prune_ratio = 0.0005 #0.0005
+
+                first_image_threshold_mask = normalized_scores[0] > prune_ratio #0.0005
+
+                keep_r = first_image_threshold_mask.sum().item()
+                
+                
+                # Ensure we always keep at least 1 token
+                keep_r = max(keep_r, 1)
+                # print(layer_idx)
+                # print("attn scores is ",attn_scores.shape)
+                # print(attn_scores)
+                # Select top indices for each batch
+                
+                top_val, top_idx = torch.topk(attn_scores, keep_r, dim=1)
+                # print("top idx is ", top_idx)
+            elif sim_method in ["first_head", "fh"]:
+                cross_attn = attn[:, :, :text_len, text_len:]
+                attn_scores = cross_attn[:, 0].sum(1) / t_len
+                # top_val = attn_scores
+                top_val, top_idx = torch.topk(attn_scores, keep_r, dim=-1)
+                
+            else:
+                raise ValueError(f"unsupportsed {sim_method=}")
+
+            t_idx = top_idx.unsqueeze(2).expand(batch_size, keep_r, hidden_size)
+            # print("t_idx idx is ", t_idx.shape)
+            # print(t_idx)
+            # print("image_states idx is ", image_states.shape)
+            # print(image_states)
+            new_image_states = image_states.gather(1, t_idx)
+            # print("new_image_states idx is ", new_image_states.shape)
+            # print(new_image_states)
+
+    
+            if merge_r > 0:
+                merge_style = kwargs.get("merge_style", "tip")
+                img_metric = metric[:, text_len:]
+                tm_idx = top_idx.unsqueeze(2).expand(batch_size, keep_r, metric.shape[-1])
+                new_img_metric = img_metric.gather(1, tm_idx)
+                if merge_style == "tome":
+                    merge_fn = bipartite_soft_matching_new(0.9,new_img_metric)
+                    new_image_states, _ = merge_wavg(merge_fn, new_image_states)
+                elif merge_style == "tip":
+                    new_image_states = bipartite_weighted_matching(
+                        new_image_states, new_img_metric, top_val, merge_r, mode="sum"
+                    )
+
+                elif merge_style == "diff":
+                    new_image_states = bipartite_diff_matching(new_image_states, top_val, merge_r, mode="sum")
+                else:
+                    raise ValueError(f"{merge_style=} not implemented!")
+
+            # merge text
+            # text_mr = kwargs.get("merge_text", 0)
+            if text_mr == 0:
+                text_r = 0
+            else:
+                text_r = 0.8
+    
+            if text_r > 0:
+                text_metric = metric[:, :text_len]
+                merge_fn = bipartite_soft_matching_new(0.9,text_metric)
+                text_states, _ = merge_wavg(merge_fn, text_states)
+                mask_m = text_masks[..., None]
+                mask_m, _ = merge_wavg(merge_fn, mask_m)
+                text_masks = mask_m[..., 0]
+
+                text_len = text_states.shape[1]
+
+            new_img_masks = torch.ones(
+                (batch_size, new_image_states.shape[1]),
+                dtype=torch.long,
+                device=new_image_states.device,
+            )
+            mask = torch.cat([text_masks, new_img_masks], dim=1)
+            x = torch.cat([text_states, new_image_states], dim=1)
+        else:
+            merge_r = int(merge_ratio)
+            if merge_r > 0:
+                merge_fn = bipartite_soft_matching(metric, merge_r)
+                x, _ = merge_wavg(merge_fn, x)
+                mask_m = mask[..., None]
+                mask_m, _ = merge_wavg(merge_fn, mask_m)
+                mask = mask_m[..., 0]
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if (layer_idx == 8):
+            print("num tokens at layer 8 is ",image_states.shape)
+        if (layer_idx == 11):
+            print("num tokens at layer 11 is ",image_states.shape)
+        return x, attn, mask, text_len
 
 class PatchEmbed(nn.Module):
     """Image to Patch Embedding"""
@@ -711,9 +1155,7 @@ class VisionTransformer(nn.Module):
             torch.stack(
                 torch.meshgrid(torch.arange(x_mask.shape[-2]), torch.arange(x_mask.shape[-1]), indexing="ij"),
                 dim=-1,
-            )[None, None, :, :, :]
-            .expand(x_mask.shape[0], x_mask.shape[1], -1, -1, -1)
-            .flatten(1, 3)
+            )[None, None, :, :, :].expand(x_mask.shape[0], x_mask.shape[1], -1, -1, -1).flatten(1, 3)
         )
         x_mask = x_mask.flatten(1)
 
@@ -721,10 +1163,6 @@ class VisionTransformer(nn.Module):
             x, label = self.mask_tokens(_x, x)
 
         if max_image_len < 0 or max_image_len is None or not isinstance(max_image_len, int):
-            # suppose aug is 800 x 1333, then, maximum effective res is 800 x 1333 (if one side gets bigger, the other will be constrained and be shrinked)
-            # (800 // self.patch_size) * (1333 // self.patch_size) is the maximum number of patches that single image can get.
-            # if self.patch_size = 32, 25 * 41 = 1025
-            # if res is 384 x 640, 12 * 20 = 240
             eff = x_h * x_w
             max_image_len = eff.max()
         else:
@@ -750,12 +1188,18 @@ class VisionTransformer(nn.Module):
                 pad_choice = torch.multinomial(torch.ones(nv).float(), p, replacement=True)
                 select.append(
                     torch.cat(
-                        [valid_row_idx[i], non_valid_row_idx[i][pad_choice]],
-                        dim=0,
+                        [valid_row_idx[i], non_valid_row_idx[i][pad_choice]], dim=0
                     )
                 )
 
         select = torch.cat(select, dim=0)
+
+        # Ensure tensors are on the same device as _x
+        device = _x.device
+        select = select.to(device)
+        patch_index = patch_index.to(device)
+        pos_embed = pos_embed.to(device)
+
         x = x[select[:, 0], select[:, 1]].view(B, -1, C)
         x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
         patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
@@ -763,15 +1207,8 @@ class VisionTransformer(nn.Module):
 
         if mask_it:
             label = label[select[:, 0], select[:, 1]].view(B, -1, 3)
-
             label[x_mask == 0] = -100
-            label = torch.cat(
-                [
-                    torch.full((label.shape[0], 1, 3), -100).to(label),
-                    label,
-                ],
-                dim=1,
-            )
+            label = torch.cat([torch.full((label.shape[0], 1, 3), -100).to(label), label], dim=1)
 
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
@@ -789,9 +1226,9 @@ class VisionTransformer(nn.Module):
         else:
             return x, x_mask, (patch_index, (H, W)), None
 
+
     def forward_features(self, _x, max_image_len=144, mask_it=False):
         x, x_mask, patch_index, label = self.visual_embed(_x, max_image_len=max_image_len, mask_it=mask_it)
-
         for blk in self.blocks:
             x, _ = blk(x, mask=x_mask)
 

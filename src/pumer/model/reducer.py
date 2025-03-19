@@ -122,6 +122,8 @@ def bipartite_soft_matching(
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
         n, t1, c = src.shape  # 1, 99, 768
+       
+
         unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
         src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
         dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
@@ -130,7 +132,148 @@ def bipartite_soft_matching(
 
     return merge
 
+def bipartite_soft_matching_new(threshold,
+    metric: torch.Tensor,
+    class_token: bool = True,
+) -> Tuple[Callable, Callable]:
 
+    """
+    Applies ToMe with adaptive thresholding based on the first batch.
+    Input size is [batch, tokens, channels].
+    r is used as an initial value but will be adjusted based on the first batch's node_max values.
+    """
+    protected = 0
+    if class_token:
+        protected += 1
+    
+    t = metric.shape[1]
+    # r = min(r, (t - protected) // 2)
+    # if r <= 0:
+    #     return do_nothing, do_nothing
+    
+    with torch.no_grad():
+        metric = metric / metric.norm(dim=-1, keepdim=True)
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        scores = a @ b.transpose(-1, -2)
+        # print("scores size is ",scores.shape)
+        if(scores.shape[1] ==0):
+            return do_nothing
+        
+        if(scores.shape[2] ==0):
+            return do_nothing
+        
+        if class_token:
+            scores[..., 0, :] = -math.inf
+        
+      
+        node_max, node_idx = scores.max(dim=-1)
+   
+        
+        # Analyze first batch to determine adaptive threshold
+        first_batch_node_max = node_max[0]  # Shape: [num_tokens]
+        sorted_similarities, sort_indices = torch.sort(first_batch_node_max, descending=True)
+
+        threshold_mask = sorted_similarities > threshold #below 0.96 is important  99999
+
+        if threshold_mask.any():
+            adaptive_r = threshold_mask.sum().item()
+            # Ensure we don't exceed original constraints
+            adaptive_r = min(adaptive_r, (t - protected) // 2)
+            # print("adaptive r is ",adaptive_r)
+        else:
+            adaptive_r = 0
+        if (adaptive_r <= 0):
+            return do_nothing
+        # print("adaptive r is ",adaptive_r)  
+        # Use adaptive_r for all batches
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+        unm_idx = edge_idx[..., adaptive_r:, :]
+
+        src_idx = edge_idx[..., :adaptive_r, :]
+   
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        # print("unmerged_tokens ",unm_idx)
+        # print("merged tokens ",src_idx)
+        if class_token:
+            unm_idx = unm_idx.sort(dim=1)[0]
+    
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        n, t1, c = src.shape
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - adaptive_r, c))
+        src = src.gather(dim=-2, index=src_idx.expand(n, adaptive_r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, adaptive_r, c), src, reduce=mode)
+        return torch.cat([unm, dst], dim=1)
+        
+    return merge
+def bipartite_soft_matching_track(
+    metric: torch.Tensor,
+    r: int,
+    class_token: bool = True,
+) -> Tuple[Callable, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Applies ToMe with a balanced matching set (50%, 50%).
+
+    Input size is [batch, tokens, channels].
+    r indicates the number of tokens to remove (max 50% of tokens).
+
+    Extra args:
+     - class_token: Whether or not there's a class token.
+
+    When enabled, the class token won't get merged.
+    """
+    protected = 0
+    if class_token:
+        protected += 1
+    # We can only reduce by a maximum of 50% tokens
+    t = metric.shape[1]  # 197
+    r = min(r, (t - protected) // 2)
+
+    if r <= 0:
+        return do_nothing, r, None, None, None
+
+    with torch.no_grad():
+        metric = metric / metric.norm(dim=-1, keepdim=True)
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]  # a: [bs, 99, 64], b [bs, 98, 64]
+        scores = a @ b.transpose(-1, -2)  # [bs, 99, 98]
+
+        if class_token:
+            scores[..., 0, :] = -math.inf
+
+        node_max, node_idx = scores.max(
+            dim=-1
+        )  # for each token in a, find most similar token in b, node_max is for a, node_idx is for b
+        edge_idx = node_max.argsort(dim=-1, descending=True)[
+            ..., None
+        ]  # [bs, 99, 1], get indices of top similar tokens
+
+        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens, [bs, 91, 1]
+        src_idx = edge_idx[..., :r, :]  # Merged Tokens, [bs, 8, 1], indices for most similar tokens
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)  # [bs, 8, 1], src_idx in b
+
+        if class_token:
+            # Sort to ensure the class token is at the start
+            unm_idx = unm_idx.sort(dim=1)[0]
+
+    def merge(x: torch.Tensor, mode="mean", prnt=False) -> torch.Tensor:
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        n, t1, c = src.shape  # 1, 99, 768
+        if prnt:
+            # print(f"\n----- ToME Merging: {r} token pairs -----")
+            for i in range(r):
+                src_token_idx = 2 * src_idx[0, i, 0].item()
+                dst_token_idx = 2 * dst_idx[0, i, 0].item() + 1
+                merged_token_idx = (t1 - r) + dst_idx[0, i, 0].item()
+            #     print(f"Merging: token {src_token_idx} (even) + token {dst_token_idx} (odd) → new token {merged_token_idx}")
+            # print(f"----- End of ToME Merging -----\n")
+
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+
+        return torch.cat([unm, dst], dim=1)
+
+    return merge, r, src_idx, dst_idx, unm_idx
 def merge_wavg(merge: Callable, x: torch.Tensor, size: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies the merge function by taking a weighted average based on token size.
@@ -139,12 +282,53 @@ def merge_wavg(merge: Callable, x: torch.Tensor, size: torch.Tensor = None) -> T
     if size is None:
         size = torch.ones_like(x[..., 0, None])
 
+    prnt = True
+
+
     x = merge(x * size, mode="sum")
     size = merge(size, mode="sum")
 
     x = x / size
     return x, size
+def merge_wavg_track(merge: Callable, x: torch.Tensor, size: torch.Tensor = None, txt=False, r=None, src_idx=None, dst_idx=None, unm_idx=None) -> Tuple[torch.Tensor, torch.Tensor, list]:
+    """
+    Applies the merge function by taking a weighted average based on token size.
+    Returns the merged tensor, the new token sizes, and the merge information.
+    """
+    if size is None:
+        size = torch.ones_like(x[..., 0, None])
 
+    prnt = True
+    if txt:
+        prnt = False
+
+    # Capture merge information
+    merge_info = []
+    def merge_with_info(x: torch.Tensor, mode="mean", prnt=False) -> torch.Tensor:
+        nonlocal merge_info
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        n, t1, c = src.shape  # 1, 99, 768
+        if prnt:
+            # print(f"\n----- ToME Merging: {r} token pairs -----")
+            for i in range(r):
+                src_token_idx = 2 * src_idx[0, i, 0].item()
+                dst_token_idx = 2 * dst_idx[0, i, 0].item() + 1
+                merged_token_idx = (t1 - r) + dst_idx[0, i, 0].item()
+                # print(f"Merging: token {src_token_idx} (even) + token {dst_token_idx} (odd) → new token {merged_token_idx}")
+                merge_info.append((src_token_idx, dst_token_idx, merged_token_idx))
+            # print(f"----- End of ToME Merging -----\n")
+
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+
+        return torch.cat([unm, dst], dim=1)
+
+    x = merge_with_info(x * size, mode="sum", prnt=prnt)
+    size = merge_with_info(size, mode="sum")
+
+    x = x / size
+    return x, size, merge_info
 
 def gumbel_softmax(logits: torch.Tensor, tau: float = 1, dim: int = -1) -> torch.Tensor:
     gumbels = (

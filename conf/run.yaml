@@ -38,7 +38,7 @@ tensorboard:
 do_train: False # finetuning
 do_eval: False
 do_step_eval: False
-do_predict: False
+do_predict: True
 do_eval_predict: False
 
 # for training, usually set do_train=True, do_eval=True, do_predict=True, if predict dataset has labels, then set do_eval_predict=True too.
@@ -74,4 +74,4 @@ train:
   save_every_steps: 1000
   num_kept_ckpt: 2
   stop_patience: 15
-  freeze_patterns:
+  freeze_patterns: 

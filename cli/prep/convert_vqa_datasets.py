@@ -283,8 +283,30 @@ def create_ans2label(occurrence, name, out_dir):
     cache_file = os.path.join(out_dir, name + "_label2ans.json")
     json.dump(label2ans, open(cache_file, "w"), indent=2)
     return ans2label
+# ####delete
+# images_path = "/home/aelagaty/Pipeline/datasets/taipei/frames324-renamed"
 
+# # Get all .jpg files from the directory
+# image_files = [f for f in os.listdir(images_path) if f.endswith(".jpg")]
 
+# # Generate qa_data
+# qa_data = []
+# for idx, image_file in enumerate(image_files, start=1):
+#     image_id = os.path.splitext(image_file)[0]
+#     qa_entry = {
+#         "image_id": image_id,
+#         "question_id": idx,
+#         "question": "Is this a car? Answer with one word only",
+#     }
+#     qa_data.append(qa_entry)
+
+# # Mapping question IDs to questions
+# id_questions = {entry["question_id"]: entry["question"] for entry in qa_data}
+
+# # Output directory and dataset type
+# out_dir = "./output"
+# print("finished id questo")
+# ###delete
 def compute_target(qa_data, id_questions, ans2label, out_dir, dataset="vqa2", split="val2014"):
     with open(f"{out_dir}/{dataset}-{split}.jsonl", "w") as f:
         for entry in qa_data:
@@ -314,11 +336,14 @@ def compute_target(qa_data, id_questions, ans2label, out_dir, dataset="vqa2", sp
                 raise ValueError("not supported dataset type: {}".format(dataset))
 
             qid = entry[q_id_field[dataset]]
-            img_id = entry[img_id_field[dataset]]
+            img_id = int(entry[img_id_field[dataset]])
             if dataset in ["vqa1", "vqa2"]:
                 q_sent = id_questions[qid]
                 if split.startswith("test"):
                     split = "test2015"
+                print("image_id is ",img_id)
+                print("imag_id_field is ",img_id_field)
+                print("ds is ",dataset)
                 image_id = "COCO_{}_{:012d}".format(split, img_id)
             else:  # vg, vizwiz or no id
                 q_sent = entry["question"]
@@ -337,7 +362,10 @@ def compute_target(qa_data, id_questions, ans2label, out_dir, dataset="vqa2", sp
             f.write(json.dumps(target, ensure_ascii=False))
             f.write("\n")
 
-
+# ##delete
+# compute_target(qa_data, id_questions, ans2label={}, out_dir=out_dir)
+# print("done")
+# ##
 def process_vqa(dataset_dir, out_dir=None, version=1):
     if out_dir is None:
         out_dir = dataset_dir

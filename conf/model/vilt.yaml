@@ -31,7 +31,7 @@ config:
     # - 6
     # - 9
   merge_ratio: 0
-  sim_method: first_head
+  sim_method: mean_head
   merge_style: tip
   merge_r: 0
   merge_text: 0

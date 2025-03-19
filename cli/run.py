@@ -2,7 +2,7 @@ import json
 import re
 import types
 from pathlib import Path
-
+import time
 import hydra
 import torch
 import transformers.optimization as opt
@@ -248,6 +248,7 @@ def train(
 
 @hydra.main(config_path="../conf", config_name="run", version_base="1.2")
 def run(cfg):
+    start_time = time.time()
     resume_ckpt_path = Path(cfg.train.resume_from_checkpoint)
 
     #### ===== init accelerator
@@ -329,7 +330,6 @@ def run(cfg):
                 param.requires_grad = False
                 accelerator.print(f"freeze {param_name}")
     model = model.to(accelerator.device)
-
     train_task = get_task(cfg.task.name)(cfg, accelerator.device)
     dev_task = get_task(cfg.task.name)(cfg, accelerator.device)
     test_task = get_task(cfg.task.name)(cfg, accelerator.device)
@@ -436,6 +436,9 @@ def run(cfg):
             json.dump(eval_results, f)
     accelerator.wait_for_everyone()
     accelerator.print("all done!")
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Total time taken: {elapsed_time:.2f} seconds")
 
 
 if __name__ == "__main__":

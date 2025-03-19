@@ -7,9 +7,10 @@ import math
 import fire
 import requests
 import torch
+import time
 from PIL import Image
 from transformers import AutoTokenizer
-
+from torchvision import transforms
 from pumer.model import get_model, get_model_config
 from pumer.model.meter.vit_meter import adapt_position_encoding
 from pumer.utils.image_utils import get_image_transforms
@@ -264,7 +265,7 @@ def convert_vilt_pretrain_nlvr2(
 
 
 def convert_vilt_pretrain(
-    orig_ckpt="data/ckpt/original/vilt_200k_mlm_itm.ckpt", out_dir="data/ckpt/converted/vilt_pretrain"
+    orig_ckpt="/home/aelagaty/Puma/PuMer/cli/data/ckpt/original/vilt_200k_mlm_itm.ckpt", out_dir="/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/vilt_pretrain"
 ):
     vilt_orig_weights = torch.load(orig_ckpt, map_location="cpu")
     convert_vilt("pretrain", vilt_orig_weights, out_dir)
@@ -344,6 +345,187 @@ def infer_vqa2(vqa_model, image_size, tokenizer, label2ans_file):
     vqa_label2ans = json.load(open(label2ans_file))  # label index
     print(pred_idx, vqa_label2ans[pred_idx])
     # should be 17, 2
+    # 1840 no
+    # 3117 yes
+def infer_meter_vqa(pixel_values,model,input_ids,attn_masks): #my model
+    outputs = model(text_ids=input_ids, text_masks=attn_masks, pixel_values=pixel_values, return_dict=True)
+
+    pred_idx=int(outputs["logits"].argmax(-1))
+    vqa_label2ans = json.load(open("/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json")) 
+    answr = vqa_label2ans[pred_idx]
+    return answr
+def frame_to_pixel_values(frame, image_size=384):
+    # Convert OpenCV frame (numpy array) to PIL Image
+    pil_image = frame
+    
+    # Define transformations
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    # Apply transformations
+    img_tensor = transform(pil_image)
+    
+    # Add batch dimension
+    pixel_values = img_tensor.unsqueeze(0)
+    return pixel_values
+def frame_to_pixel_values_batch(frame, image_size=384):
+    """
+    Convert a PIL image to a normalized tensor without a batch dimension.
+
+    Args:
+        frame (PIL.Image): Input image.
+        image_size (int): Size to resize the image to (default: 384).
+
+    Returns:
+        torch.Tensor: Tensor with shape [3, height, width].
+    """
+    # Define transformations
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),  # Resize to the desired size
+        transforms.ToTensor(),  # Convert to tensor
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # Normalize
+    ])
+    
+    # Apply transformations
+    img_tensor = transform(frame)  # Shape: [3, 384, 384]
+    
+    return img_tensor 
+def infer_meter_vqa_batch(pixel_values, model, input_ids, attn_masks):
+    """
+    Perform batch inference for VQA.
+
+    Args:
+        pixel_values (torch.Tensor): Batch of images, shape [batch_size, channels, height, width].
+        model (torch.nn.Module): The ViLT model.
+        input_ids (torch.Tensor): Tokenized input IDs for the prompt, shape [1, seq_len].
+        attn_masks (torch.Tensor): Attention masks for the prompt, shape [1, seq_len].
+
+    Returns:
+        list: List of answers for each image in the batch.
+    """
+    # Replicate input_ids and attn_masks for the entire batch
+    batch_size = pixel_values.size(0)
+    input_ids = input_ids.repeat(batch_size, 1)  # Shape: [batch_size, seq_len]
+    attn_masks = attn_masks.repeat(batch_size, 1)  # Shape: [batch_size, seq_len]
+
+    # Perform batch inference
+    with torch.no_grad():
+        outputs = model(text_ids=input_ids, text_masks=attn_masks, pixel_values=pixel_values, return_dict=True)
+
+    # Get predicted indices for each image in the batch
+    pred_indices = outputs["logits"].argmax(-1).cpu().numpy()  # Shape: [batch_size]
+
+    # Load the label-to-answer mapping
+    vqa_label2ans = json.load(open("/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json"))
+
+    # Map predicted indices to answers
+    answers = [vqa_label2ans[idx] for idx in pred_indices]
+
+    return answers
+def predict_vilt(batch_size: int, image_path: Union[str, List[str]], model: str, prompt: str) -> Optional[Union[str, List[str]]]:
+    """
+    Predicts answers to visual questions using the ViLT model.
+
+    Args:
+        batch_size (int): The number of images to process. If 1, a single image is processed.
+                          If greater than 1, a batch of images is processed.
+        image_path (Union[str, List[str]]): The path to the image or a list of paths to images.
+        model (str): The model to use for prediction. Must be either "viltpumer" or "vilt".
+        prompt (str): The question or prompt to ask about the image(s).
+
+    Returns:
+        Optional[Union[str, List[str]]]: The predicted answer(s) to the question(s). 
+                                          If batch_size is less than 1, returns None.
+                                          If batch_size is 1, returns a single answer.
+                                          If batch_size is greater than 1, returns a list of answers.
+    """
+
+    if (model == "viltpumer"):
+        model_path = "/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/ViltPumerVQA"
+    else:
+        model_path = "/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/ViltVQA"
+    cfg_class = get_model_config("vilt")
+    cfg = cfg_class()
+    model_class = get_model("vilt", "vqa2")
+    input_ids, attn_masks = get_text_inputs(prompt, cfg.tokenizer)   
+    model = model_class.from_pretrained(model_path,ignore_mismatched_sizes=True)#ViltVQA
+    model.eval()
+
+    if (batch_size  < 1):
+        return 
+    elif (batch_size == 1 ):
+        pixel_values = frame_to_pixel_values(Image.open(image_path))
+        outputs = model(text_ids=input_ids, text_masks=attn_masks, pixel_values=pixel_values, return_dict=True)
+
+        pred_idx=int(outputs["logits"].argmax(-1))
+        vqa_label2ans = json.load(open("/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json")) 
+        answr = vqa_label2ans[pred_idx]
+        return answr
+    else:
+        batch_images = [frame_to_pixel_values_batch(Image.open(path)) for path in image_path]
+        pixel_values = torch.stack(batch_images) 
+        batch_size = pixel_values.size(0)
+        input_ids = input_ids.repeat(batch_size, 1)  # Shape: [batch_size, seq_len]
+        attn_masks = attn_masks.repeat(batch_size, 1)  # Shape: [batch_size, seq_len]
+
+        # Perform batch inference
+        with torch.no_grad():
+            outputs = model(text_ids=input_ids, text_masks=attn_masks, pixel_values=pixel_values, return_dict=True)
+
+        # Get predicted indices for each image in the batch
+        pred_indices = outputs["logits"].argmax(-1).cpu().numpy()  # Shape: [batch_size]
+
+        # Load the label-to-answer mapping
+        vqa_label2ans = json.load(open("/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json"))
+
+        # Map predicted indices to answers
+        answers = [vqa_label2ans[idx] for idx in pred_indices]
+        return answers
+
+    if (model == "viltpumer"):
+        model_path = "/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/ViltPumerVQA"
+    else:
+        model_path = "/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/ViltVQA"
+    cfg_class = get_model_config("vilt")
+    cfg = cfg_class()
+    model_class = get_model("vilt", "vqa2")
+    input_ids, attn_masks = get_text_inputs(prompt, cfg.tokenizer)   
+    model = model_class.from_pretrained(model_path,ignore_mismatched_sizes=True)#ViltVQA
+    model.eval()
+
+    if (batch_size  < 1):
+        return 
+    elif (batch_size == 1 ):
+        pixel_values = frame_to_pixel_values(Image.open(image_path))
+        outputs = model(text_ids=input_ids, text_masks=attn_masks, pixel_values=pixel_values, return_dict=True)
+
+        pred_idx=int(outputs["logits"].argmax(-1))
+        vqa_label2ans = json.load(open("/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json")) 
+        answr = vqa_label2ans[pred_idx]
+        return answr
+    else:
+        batch_images = [frame_to_pixel_values_batch(Image.open(path)) for path in image_path]
+        pixel_values = torch.stack(batch_images) 
+        batch_size = pixel_values.size(0)
+        input_ids = input_ids.repeat(batch_size, 1)  # Shape: [batch_size, seq_len]
+        attn_masks = attn_masks.repeat(batch_size, 1)  # Shape: [batch_size, seq_len]
+
+        # Perform batch inference
+        with torch.no_grad():
+            outputs = model(text_ids=input_ids, text_masks=attn_masks, pixel_values=pixel_values, return_dict=True)
+
+        # Get predicted indices for each image in the batch
+        pred_indices = outputs["logits"].argmax(-1).cpu().numpy()  # Shape: [batch_size]
+
+        # Load the label-to-answer mapping
+        vqa_label2ans = json.load(open("/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json"))
+
+        # Map predicted indices to answers
+        answers = [vqa_label2ans[idx] for idx in pred_indices]
+        return answers
 
 
 def infer_nlvr2(nvlr2_model, image_size, tokenizer):
@@ -374,7 +556,7 @@ def infer_nlvr2(nvlr2_model, image_size, tokenizer):
 
 
 def test_infer_vilt_vqa2(
-    model_path="data/ckpt/converted/vilt_vqa2", label2ans_file="data/datasets/vqa2/vilt_label2ans.json"
+    model_path="/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/ViltPumerVQA", label2ans_file="/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json"
 ):
     cfg_class = get_model_config("vilt")
     cfg = cfg_class()
@@ -386,23 +568,27 @@ def test_infer_vilt_vqa2(
     # modify cfg after model loads checkpoint
     # model.config.update({"a": 1, "b": 2, "max_text_len": 25})
     model.eval()
-    print("initialized vilt vqa2")
     infer_vqa2(model, 384, cfg.tokenizer, label2ans_file)
 
 
 def test_infer_meter_vqa2(
-    model_path="data/ckpt/converted/meter_vqa2", label2ans_file="data/datasets/vqa2/vilt_label2ans.json"
-):
+    model_path="/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/MeterPumerVQA", label2ans_file="/home/aelagaty/Puma/PuMer/cli/data/datasets/vqa2/vqa2_label2ans.json"
+):  
+    start_time = time.time()
     cfg_class = get_model_config("meter")
     cfg = cfg_class()
     model_class = get_model("meter", "vqa2")
+    print("type of modle class ",type(model_class))
+    print("value of modle class ",model_class)
     model = model_class.from_pretrained(model_path)
     model.eval()
-    print("initialized meter vqa2")
-    infer_vqa2(model, 576, cfg.tokenizer, label2ans_file)
+    infer_vqa2(model, 384, cfg.tokenizer, label2ans_file)
+    end_time = time.time()
+    execution_time = end_time - start_time 
+    print(f"Execution time: {execution_time:.2f} seconds")
 
 
-def test_infer_vilt_nlvr2(model_path="data/ckpt/converted/vilt_nlvr2"):
+def test_infer_vilt_nlvr2(model_path="/home/aelagaty/Puma/PuMer/cli/data/ckpt/converted/ViltPumerNLVR"):
     cfg_class = get_model_config("vilt")
     cfg = cfg_class()
     model_class = get_model("vilt", "nlvr2")

@@ -31,9 +31,10 @@ gradcam_train_file: None # vqa2-train2014.gradcam384-16.jsonl
 gradcam_val_file: None # vqa2-val2014.gradcam384-16.jsonl
 
 image_db_dir: /tmp/lmdb
-trainval_db: coco-trainval2014.lmdb
 
-test_db: coco-test2015.lmdb
+train_db: train2014.lmdb
+dev_db: val2014.lmdb
+test_db: test2015.lmdb
 
 dev_file: vqa2-val2014.jsonl
 test_file: vqa2-test2015.jsonl
@@ -50,7 +51,7 @@ eval_dataset:
   image_size: ${task.image_size}
   is_clip: ${task.is_clip}
   dataset_file: ${task.dataset_dir}/${task.dev_file}
-  image_db_path: ${task.image_db_dir}/${task.trainval_db}
+  image_db_path: ${task.image_db_dir}/${task.dev_db}
   gradcam_file: ${task.dataset_dir}/${task.gradcam_val_file}
 
 predict_dataset: ${task.test_dataset}
@@ -75,5 +76,5 @@ train_dataset:
   image_size: ${task.image_size}
   is_clip: ${task.is_clip}
   dataset_file: ${task.dataset_dir}/${task.train_file}
-  image_db_path: ${task.image_db_dir}/${task.trainval_db}
+  image_db_path: ${task.image_db_dir}/${task.train_db}
   gradcam_file: ${task.dataset_dir}/${task.gradcam_train_file}

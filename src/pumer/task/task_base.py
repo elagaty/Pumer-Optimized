@@ -27,7 +27,7 @@ class Task(object):
         labels = batch.get("labels", None)
         if labels is not None:
             labels = gather_fn(labels)
-            score = self.metric(preds, labels)
+            score = self.metric(preds, labels) #slef.VQA2Accuracy(preds,labels)
 
         task_loss = outputs.loss
         loss = None

@@ -278,7 +278,8 @@ class BertCrossLayer(nn.Module):
         encoder_attention_mask=None,
         output_attentions=False,
         **kwargs,
-    ):
+    ): #layer_output, text_masks(attentions_mask), image_states(encoder_hidden_States), image_masks(encoder_attention_mask), txt2img_attn
+
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = None  # past_key_value[:2] if past_key_value is not None else None
         self_attention_outputs = self.attention(

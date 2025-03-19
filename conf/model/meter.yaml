@@ -1,6 +1,6 @@
 name: meter
 
-ckpt: converted/meter_pretrain_384 # finetuned/meter_vqa
+ckpt: csarron/meter-ve-p0.3r0.5t0.2-0246 #finetuned/meter_vqa #converted/meter_pretrain_384 # finetuned/meter_vqa
 
 ckpt_path: ${data_dir}/ckpt/${model.ckpt}
 
